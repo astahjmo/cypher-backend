@@ -28,30 +28,34 @@ class RepositoryConfigRepository:
         config_docs = self.collection.find({"user_id": user_id})
         return [RepositoryConfig(**doc) for doc in config_docs]
 
+    # --- NEW: Method to find all configurations ---
+    def find_all(self) -> List[RepositoryConfig]:
+        """Finds all repository configurations in the collection."""
+        config_docs = self.collection.find({})
+        return [RepositoryConfig(**doc) for doc in config_docs]
+    # --- End NEW ---
+
     def upsert_config(self, user_id: PyObjectId, repo_full_name: str, branches: List[str]) -> RepositoryConfig:
         """Creates or updates a repository configuration."""
-        # Use timezone-aware UTC now
         now = now_utc()
-        # Use find_one_and_update with upsert=True to handle create or update atomically
         updated_doc = self.collection.find_one_and_update(
             {"user_id": user_id, "repo_full_name": repo_full_name},
             {
                 "$set": {
                     "auto_build_branches": branches,
-                    "updated_at": now # Set timezone-aware UTC time
+                    "updated_at": now
                 },
-                "$setOnInsert": { # Fields to set only if creating a new document
+                "$setOnInsert": {
                     "user_id": user_id,
                     "repo_full_name": repo_full_name,
-                    "created_at": now # Set timezone-aware UTC time
+                    "created_at": now
                 }
             },
-            upsert=True, # Create the document if it doesn't exist
-            return_document=ReturnDocument.AFTER # Return the document after the update/insert
+            upsert=True,
+            return_document=ReturnDocument.AFTER
         )
 
         if not updated_doc:
-             # This should ideally not happen with upsert=True and ReturnDocument.AFTER
              logger.error(f"Upsert failed to return document for user {user_id}, repo {repo_full_name}")
              raise Exception("Failed to create or update repository configuration.")
 
@@ -68,18 +72,14 @@ class RepositoryConfigRepository:
             logger.warning(f"Attempted to delete non-existent config for user {user_id}, repo {repo_full_name}")
         return deleted
 
-    # Modified: Removed user_id parameter
     def is_branch_configured_for_build(self, repo_full_name: str, branch: str) -> bool:
         """
         Checks if a specific branch within a repository is configured for automatic builds (by any user).
         """
-        # Query for a document matching repo_full_name and where the branch exists in the auto_build_branches array.
         config_doc = self.collection.find_one({
             "repo_full_name": repo_full_name,
-            "auto_build_branches": branch # Directly check if the branch string is in the array
+            "auto_build_branches": branch
         })
-
-        # If a document is found, it means the branch is configured by at least one user.
         is_configured = config_doc is not None
         if is_configured:
             logger.info(f"Branch '{branch}' in repo '{repo_full_name}' IS configured for auto-build.")
@@ -89,7 +89,6 @@ class RepositoryConfigRepository:
 
 
 # --- Dependency Function ---
-# Add a function that FastAPI can use to inject a RepositoryConfigRepository instance
 def get_repo_config_repository(db: Database = Depends(get_database)) -> RepositoryConfigRepository:
     """Dependency function to provide a RepositoryConfigRepository instance."""
     return RepositoryConfigRepository(db)

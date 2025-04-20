@@ -16,9 +16,8 @@ class BuildStatusRepository:
     def __init__(self, db: Database):
         self.collection = db["build_statuses"]
 
-    def create_build_status(self, user_id: PyObjectId, repo_full_name: str, branch: str, commit_sha: Optional[str] = None, commit_message: Optional[str] = None) -> BuildStatus:
+    def create_build_status(self,tag_version: str, user_id: PyObjectId, repo_full_name: str, branch: str, commit_sha: Optional[str] = None, commit_message: Optional[str] = None) -> BuildStatus:
         """Creates a new build status record."""
-        # Use timezone-aware UTC now
         now = now_utc()
         build_doc = {
             "_id": ObjectId(),
@@ -28,18 +27,15 @@ class BuildStatusRepository:
             "commit_sha": commit_sha,
             "commit_message": commit_message,
             "status": "pending",
-            "created_at": now, # Use timezone-aware UTC
-            "updated_at": now # Set initial updated_at with timezone-aware UTC
+            "created_at": now,
+            "updated_at": now
         }
         insert_result = self.collection.insert_one(build_doc)
-        # Fetch the created document to return the model instance
         created_doc = self.collection.find_one({"_id": insert_result.inserted_id})
         if not created_doc:
              logger.error(f"Failed to retrieve newly created build status for user {user_id}, repo {repo_full_name}")
-             # Consider raising a more specific exception or handling differently
              raise Exception("Failed to retrieve newly created build status document.")
         logger.info(f"Created build status {created_doc['_id']} for {repo_full_name} branch {branch}")
-        # Ensure the returned object matches the BuildStatus model structure
         return BuildStatus(**created_doc)
 
 
@@ -64,14 +60,8 @@ class BuildStatusRepository:
         """Updates specific fields of a build status record."""
         if not updates:
             return False
-
-        # Use timezone-aware UTC now
         now = now_utc()
-        updates["updated_at"] = now # Always update the timestamp
-
-        # Ensure status transitions are valid if needed (e.g., don't go from success to running)
-        # For now, just update
-        # Set completed_at when reaching a final state, using timezone-aware UTC
+        updates["updated_at"] = now
         if "status" in updates and updates["status"] in ["success", "failed", "cancelled"]:
              updates["completed_at"] = now
 
@@ -83,9 +73,28 @@ class BuildStatusRepository:
         if result.modified_count > 0:
              logger.info(f"Updated build status {build_id} with fields: {list(updates.keys())}")
              return True
-        # matched_count > 0 but modified_count == 0 means the data was the same
         logger.info(f"Build status {build_id} already had the target values. No update performed.")
-        return True # Indicate success even if no fields changed
+        return True
+
+    # --- NEW Method to find latest successful build ---
+    def find_latest_successful_build(self, repo_full_name: str, user_id: PyObjectId) -> Optional[BuildStatus]:
+        """Finds the most recent successful build for a specific repo and user."""
+        build_doc = self.collection.find_one(
+            {
+                "repo_full_name": repo_full_name,
+                "user_id": user_id,
+                "status": "success",
+                "image_tag": {"$ne": None} # Ensure it has an image tag
+            },
+            sort=[("created_at", DESCENDING)]
+        )
+        if build_doc:
+            logger.info(f"Found latest successful build {build_doc['_id']} for {repo_full_name}, user {user_id}")
+            return BuildStatus(**build_doc)
+        else:
+            logger.info(f"No successful build found for {repo_full_name}, user {user_id}")
+            return None
+    # --- End NEW ---
 
 # --- Dependency Function ---
 def get_build_status_repository(db: Database = Depends(get_database)) -> BuildStatusRepository:

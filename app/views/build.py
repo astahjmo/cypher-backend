@@ -3,8 +3,8 @@ import asyncio
 import os
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse # Removed JSONResponse
-# Removed jsonable_encoder
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel # Import BaseModel
 from typing import List, Dict, Optional, Any
 from bson import ObjectId
 import time
@@ -19,6 +19,11 @@ from repositories.repository_config_repository import RepositoryConfigRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Builds"]) # Prefix is applied in main.py
+
+# --- Pydantic Model for Request Body ---
+# Changed 'tag' to 'tag_version'
+class TriggerBuildRequest(BaseModel):
+    tag_version: str
 
 # --- Helper Function for SSE ---
 # (log_stream_generator remains the same)
@@ -158,25 +163,26 @@ async def log_stream_generator(build_id_str: str, build_status_repo: BuildStatus
 
 # --- API Routes ---
 
-# Restore response_model_by_alias=True (should work with model config)
 @router.post("/docker/{owner}/{repo_name}/{branch}", response_model_by_alias=True)
 async def trigger_docker_build(
     owner: str,
     repo_name: str,
     branch: str,
-    request: Request,
+    request_body: TriggerBuildRequest, # Accept request body with tag_version
+    request: Request, # Keep request if needed elsewhere
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user_from_token),
     repo_config_repo: RepositoryConfigRepository = Depends(get_repo_config_repository),
     build_status_repo: BuildStatusRepository = Depends(get_build_status_repository),
     build_log_repo: BuildLogRepository = Depends(get_build_log_repository)
 ):
-    """Triggers a manual Docker build for a specific repository and branch."""
+    """Triggers a manual Docker build for a specific repository and branch, using the provided tag version."""
     # Returns dict, alias doesn't apply here
     return await handle_docker_build_trigger(
         owner=owner,
         repo_name=repo_name,
         branch=branch,
+        tag_version=request_body.tag_version, # Pass the tag_version from the request body
         user=user,
         background_tasks=background_tasks,
         repo_config_repo=repo_config_repo,
@@ -199,7 +205,6 @@ async def stream_build_logs(
         media_type="text/event-stream"
     )
 
-# Restore response_model and response_model_by_alias=True
 @router.get("/statuses", response_model=List[BuildStatus], response_model_by_alias=True)
 async def get_all_build_statuses(
     user: User = Depends(get_current_user_from_token),
@@ -208,7 +213,6 @@ async def get_all_build_statuses(
     """Retrieves all build statuses."""
     return build_status_repo.get_all_builds()
 
-# Restore response_model and response_model_by_alias=True
 @router.get("/{build_id}", response_model=BuildStatus, response_model_by_alias=True)
 async def get_build_status_details(
     build_id: str,
@@ -224,7 +228,6 @@ async def get_build_status_details(
         raise HTTPException(status_code=404, detail="Build not found.")
     return build
 
-# Restore response_model and response_model_by_alias=True
 @router.get("/{build_id}/logs", response_model=List[BuildLog], response_model_by_alias=True)
 async def get_build_logs_history(
     build_id: str,

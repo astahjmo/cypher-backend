@@ -1,7 +1,7 @@
 import os
 import logging
 import requests
-from fastapi import Request, HTTPException, Depends, status
+from fastapi import Request, HTTPException, Depends, status, Cookie # Import Cookie
 from fastapi.responses import RedirectResponse
 from requests_oauthlib import OAuth2Session
 from oauthlib.oauth2 import WebApplicationClient, OAuth2Error
@@ -13,6 +13,7 @@ from pymongo import DESCENDING
 from bson import ObjectId
 from datetime import datetime, timedelta, timezone
 from pydantic import ValidationError
+from typing import Optional # Import Optional
 
 # JWT Handling
 from jose import JWTError, jwt
@@ -70,24 +71,26 @@ async def handle_login_redirect() -> RedirectResponse:
     logger.info(f"Generated OAuth state: {state} (key: {state_key})")
 
     response = RedirectResponse(authorization_url)
+    # Use secure=True if served over HTTPS in production
     response.set_cookie(key="oauth_state_key", value=state_key, max_age=300, httponly=True, samesite='lax', secure=False)
     return response
 
 # handle_github_callback function is REMOVED from this file. Its logic is in views/auth.py
 
 # --- Secure Dependency to Get Current User ---
-# This remains in the controller as it's used by multiple views
+# Modified to use Cookie dependency instead of Request
 async def get_current_user_from_token(
-    request: Request,
-    # Depend on the UserRepository instance provided by its dependency function
+    # Inject the access_token cookie directly, make it optional
+    access_token: Optional[str] = Cookie(None),
+    # Depend on the UserRepository instance
     user_repo: UserRepository = Depends(get_user_repository)
 ) -> User:
     """
-    FastAPI dependency to verify JWT from cookie and return the current user.
+    FastAPI dependency to verify JWT from 'access_token' cookie and return the current user.
     Raises HTTPException 401 if token is invalid, expired, or user not found.
     """
-    token = request.cookies.get("access_token")
-    if not token:
+    # Use the injected access_token variable
+    if not access_token:
         logger.debug("Access token cookie not found for secure endpoint.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -104,7 +107,8 @@ async def get_current_user_from_token(
         if not settings.SECRET_KEY:
              logger.critical("JWT SECRET_KEY is not configured!")
              raise ValueError("JWT Secret Key is missing in configuration.")
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        # Decode the injected access_token
+        payload = jwt.decode(access_token, settings.SECRET_KEY, algorithms=[ALGORITHM])
         user_id_str: str | None = payload.get("sub")
         if user_id_str is None:
             logger.warning("Token payload missing 'sub' (user ID).")
@@ -120,11 +124,13 @@ async def get_current_user_from_token(
         raise credentials_exception from e
 
     try:
+        # find_user_by_id is synchronous
         user = user_repo.find_user_by_id(user_id_str)
         if user is None:
             logger.warning(f"User with ID {user_id_str} from token not found in database.")
             raise credentials_exception
         logger.debug(f"Successfully authenticated user ID: {user.id}")
+        # Ensure sensitive data like token is not returned unless needed downstream
         user.github_access_token = None
         return user
     except Exception as e:

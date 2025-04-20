@@ -1,60 +1,96 @@
+import asyncio
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware # Import CORS Middleware
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from config import settings
-from services.db_service import connect_to_mongo, close_mongo_connection
-# Import routers from the 'views' directory
-from views import auth, github, build, webhooks # Ensure 'build' is imported from views
 import logging
-# Removed datetime, timezone, jsonable_encoder, JSONResponse, json, Any imports as they are no longer needed here
 
-# Configure basic logging
+from config import settings
+# Import db_service and get_database directly
+from services.db_service import connect_to_mongo, close_mongo_connection, get_database, db_service
+# Import routers
+from views import auth as auth_views, github as github_views, build as build_views, webhooks as webhooks_views
+from controllers import containers as containers_controller
+# Import the broadcast task function
+from controllers.containers import broadcast_status_updates
+# Import repositories needed for broadcast task
+from repositories.repository_config_repository import RepositoryConfigRepository
+# Import User model for broadcast task (if needed, maybe not directly)
+from models import User
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Removed Custom JSON Encoder and CustomJSONResponse class
+background_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Code to run on startup
+    global background_task
     logger.info("Application startup...")
+    # Connect to MongoDB - connect_to_mongo handles setting up db_service.db
     await connect_to_mongo()
-    yield
+
+    # Ensure DB connection is established before proceeding
+    db = db_service.get_db() # Get the synchronous DB instance
+    if db is None: # Correct check for None
+        logger.critical("Database connection failed on startup. Aborting background task setup.")
+        # Optionally raise an error or handle differently
+        yield # Allow app to potentially start but background task won't run
+        logger.info("Application shutdown...")
+        await close_mongo_connection()
+        return # Exit lifespan early
+
+    # Create repository instances needed for the broadcast task
+    # Pass the synchronous pymongo Database object
+    repo_config_repo = RepositoryConfigRepository(db=db)
+
+    # Start the WebSocket broadcast task, passing necessary dependencies
+    logger.info("Starting WebSocket status broadcast task...")
+    # Pass the repository instance to the task function
+    background_task = asyncio.create_task(broadcast_status_updates(repo_config_repo=repo_config_repo))
+
+    yield # Application runs here
+
     # Code to run on shutdown
     logger.info("Application shutdown...")
+    if background_task:
+        logger.info("Cancelling WebSocket status broadcast task...")
+        background_task.cancel()
+        try:
+            await background_task
+        except asyncio.CancelledError:
+            logger.info("WebSocket broadcast task successfully cancelled.")
+        except Exception as e:
+            logger.error(f"Error during background task cancellation: {e}", exc_info=True)
+
     await close_mongo_connection()
 
 app = FastAPI(
     title=settings.APP_NAME,
     description="Backend API for PaaS platform integrating GitHub, Docker, and Kubernetes.",
     version="0.1.0",
-    lifespan=lifespan # Register the lifespan context manager
-    # Removed default_response_class=CustomJSONResponse
+    lifespan=lifespan
 )
 
-# Define allowed origins
 origins = [
-    "http://localhost:8080", # Frontend development server
-    # "https://your-production-frontend.com", # Example production URL
+    "http://localhost:8080",
 ]
 
-# Add CORS middleware with specific origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, # Use the specific list of allowed origins
-    allow_credentials=True, # Allow cookies to be sent
-    allow_methods=["*"], # Allows all standard methods
-    allow_headers=["*"], # Allows all headers
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Include routers from the views layer
-app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
-app.include_router(github.router, prefix="/repositories", tags=["GitHub Repositories"]) # Updated tag
-app.include_router(build.router, prefix="/build", tags=["Builds"]) # Correctly includes build router from views
-app.include_router(webhooks.router, prefix="/webhooks", tags=["Webhooks"])
+# Include routers
+app.include_router(auth_views.router, prefix="/auth", tags=["Authentication"])
+app.include_router(github_views.router, prefix="/repositories", tags=["GitHub Repositories"])
+app.include_router(build_views.router, prefix="/build", tags=["Builds"])
+app.include_router(webhooks_views.router, prefix="/webhooks", tags=["Webhooks"])
+app.include_router(containers_controller.router)
+
 
 @app.get("/health", tags=["Health Check"])
 async def health_check():
-    """Basic health check endpoint."""
-    # Could add a DB check here later if needed
     return {"status": "OK"}
