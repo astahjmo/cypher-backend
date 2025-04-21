@@ -1,93 +1,62 @@
-import logging
 from pymongo.database import Database
-from pymongo import DESCENDING
-from datetime import datetime, timezone # Import timezone
+from pymongo.errors import ConnectionFailure, OperationFailure
+from pymongo import ASCENDING
 from bson import ObjectId
-from typing import List, Optional, Dict, Any # Added Dict, Any
-from fastapi import Depends # Import Depends
+from typing import List, Optional
+import logging
 
-# Import models and db service
-from models import BuildLog, PyObjectId, now_utc # Import now_utc helper
-from services.db_service import get_database # Import get_database
+# Import BuildLog model from its new location
+from models.build.db_models import BuildLog
+# Import PyObjectId from base
+from models.base import PyObjectId
+# Import get_database dependency
+from services.db_service import get_database
+from fastapi import Depends # Keep Depends for dependency injection
 
 logger = logging.getLogger(__name__)
 
 class BuildLogRepository:
+    """Handles database operations for BuildLog objects."""
+
     def __init__(self, db: Database):
         self.collection = db["build_logs"]
-        # Consider creating an index on build_id and timestamp for faster log retrieval
-        # self.collection.create_index([("build_id", 1), ("timestamp", 1)])
+        logger.info("BuildLogRepository initialized.")
 
-    def add_log(self, build_id: PyObjectId, message: str, log_type: str = "log", timestamp: Optional[datetime] = None):
-        """Adds a new single log entry for a build."""
-        # Use timezone-aware UTC now if timestamp not provided
-        if timestamp is None:
-            timestamp = now_utc()
-        # Ensure provided timestamp is timezone-aware (assume UTC if naive, though ideally it should be aware)
-        elif timestamp.tzinfo is None:
-             timestamp = timestamp.replace(tzinfo=timezone.utc)
-
-
-        log_doc = {
-            "build_id": build_id,
-            "timestamp": timestamp,
-            "type": log_type,
-            "message": message
-        }
+    def insert_many(self, logs: List[BuildLog]) -> List[PyObjectId]:
+        """Inserts multiple build log entries."""
+        if not logs:
+            return []
+        logger.debug(f"Inserting {len(logs)} log entries for build ID: {logs[0].build_id}")
         try:
-            self.collection.insert_one(log_doc)
-            # logger.debug(f"Added log for build {build_id}: {message[:50]}...") # Optional: Debug log
+            # Use model_dump for Pydantic v2, exclude 'id'
+            log_data = [log.model_dump(by_alias=True, exclude={'id'}) for log in logs]
+            result = self.collection.insert_many(log_data)
+            return result.inserted_ids # Return list of inserted ObjectIds
+        except OperationFailure as e:
+            logger.error(f"Database operation failed inserting logs for build {logs[0].build_id}: {e}", exc_info=True)
+            raise
         except Exception as e:
-            logger.error(f"Failed to add log for build {build_id}: {e}", exc_info=True)
+            logger.error(f"Unexpected error inserting logs for build {logs[0].build_id}: {e}", exc_info=True)
+            raise
 
-    def add_many_logs(self, log_documents: List[Dict[str, Any]]):
-        """Adds multiple log entries for a build using insert_many."""
-        if not log_documents:
-            logger.warning("Attempted to add an empty list of log documents.")
-            return 0
-
-        build_id = log_documents[0].get("build_id", "UNKNOWN") # Get build_id for logging
-
-        # Ensure all documents have a timezone-aware UTC timestamp
-        current_time_utc = now_utc()
-        for doc in log_documents:
-            if "timestamp" not in doc or doc["timestamp"] is None:
-                doc["timestamp"] = current_time_utc
-            elif isinstance(doc["timestamp"], datetime) and doc["timestamp"].tzinfo is None:
-                 doc["timestamp"] = doc["timestamp"].replace(tzinfo=timezone.utc)
-            # If timestamp is already aware, keep it
-
+    def find_by_build_id(self, build_id: str) -> List[BuildLog]:
+        """Finds all log entries for a specific build ID, sorted by timestamp."""
+        logger.debug(f"Finding logs for build ID: {build_id}")
         try:
-            result = self.collection.insert_many(log_documents, ordered=False) # ordered=False might improve performance slightly
-            inserted_count = len(result.inserted_ids)
-            logger.info(f"Added {inserted_count} log entries for build {build_id} via insert_many.")
-            return inserted_count
+            logs_cursor = self.collection.find({"build_id": build_id}).sort("_id", ASCENDING)
+            print(build_id)
+            return [BuildLog.model_validate(log) for log in logs_cursor]
+        except ValueError: # Handle invalid ObjectId format
+            logger.warning(f"Invalid ObjectId format provided for find_by_build_id: {build_id}")
+            return [] # Return empty list for invalid ID
+        except OperationFailure as e:
+            logger.error(f"Database operation failed finding logs for build {build_id}: {e}", exc_info=True)
+            raise
         except Exception as e:
-            logger.error(f"Failed to add logs in bulk for build {build_id}: {e}", exc_info=True)
-            return 0
+            logger.error(f"Unexpected error finding logs for build {build_id}: {e}", exc_info=True)
+            raise
 
-
-    def get_logs_by_build(self, build_id: PyObjectId, limit: int = 1000) -> List[BuildLog]:
-        """Retrieves log entries for a specific build, sorted by timestamp."""
-        query = {"build_id": build_id}
-        # Sort by timestamp ascending
-        log_cursor = self.collection.find(query).sort("_id", 1)
-        if limit > 0:
-            log_cursor = log_cursor.limit(limit)
-
-        logs = [BuildLog(**doc) for doc in log_cursor]
-        return logs
-
-    def delete_logs_by_build(self, build_id: PyObjectId) -> int:
-        """Deletes all log entries for a specific build."""
-        result = self.collection.delete_many({"build_id": build_id})
-        deleted_count = result.deleted_count
-        if deleted_count > 0:
-            logger.info(f"Deleted {deleted_count} log entries for build {build_id}")
-        return deleted_count
-
-# --- Dependency Function ---
-# Ensure this function is correctly defined and present
+# --- FastAPI Dependency ---
 def get_build_log_repository(db: Database = Depends(get_database)) -> BuildLogRepository:
-    """Dependency function to provide a BuildLogRepository instance."""
-    return BuildLogRepository(db)
+    """FastAPI dependency to get an instance of BuildLogRepository."""
+    return BuildLogRepository(db=db)

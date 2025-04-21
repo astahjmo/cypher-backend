@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Backend for the Cypher application"
 authors = ["Your Name <you@example.com>"] # Substitua com suas informações
 readme = "README.md" # Crie um README.md se necessário
+package-mode = false # Adicionado para indicar que não é um pacote instalável
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -20,6 +21,12 @@ GitPython = "^3.1.43"
 aiofiles = "^23.2.1"
 cachetools = "^5.3.3" # Keep for now, or remove if only async-lru is needed
 async-lru = "^2.0.4" # Added async-lru
+
+# Adicionado grupo de dependências de desenvolvimento
+[tool.poetry.group.dev.dependencies]
+sseclient-py = "^1.8.0" # Adicionada dependência para o teste SSE
+pytest = "^8.0.0" # Exemplo de outra dependência dev comum
+requests = "^2.31.0" # Adicionado requests aqui também, já que o teste usa
 
 [tool.poetry.scripts]
 start = "uvicorn app.main:app --reload --host 0.0.0.0 --port 5000"

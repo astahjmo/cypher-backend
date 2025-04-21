@@ -1,56 +1,58 @@
 import asyncio
 from fastapi import FastAPI
+from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
+# Removed BackgroundTasksMiddleware imports
+# from starlette.middleware.base import BaseHTTPMiddleware
+# from starlette.middleware import Middleware
+# from starlette.background import BackgroundTasks
 from contextlib import asynccontextmanager
 import logging
 
 from config import settings
 # Import db_service and get_database directly
 from services.db_service import connect_to_mongo, close_mongo_connection, get_database, db_service
-# Import routers
-from views import auth as auth_views, github as github_views, build as build_views, webhooks as webhooks_views
-from controllers import containers as containers_controller
+# Import views for routers
+from views import auth as auth_views
+from views import github as github_views
+from views import webhooks as webhooks_views
+from views import build as build_views
+from views import containers as containers_views
 # Import the broadcast task function
 from controllers.containers import broadcast_status_updates
 # Import repositories needed for broadcast task
 from repositories.repository_config_repository import RepositoryConfigRepository
 # Import User model for broadcast task (if needed, maybe not directly)
-from models import User
+from models.auth.db_models import User
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 background_task = None
 
+# Removed BackgroundTasksMiddleware class definition
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global background_task
     logger.info("Application startup...")
-    # Connect to MongoDB - connect_to_mongo handles setting up db_service.db
     await connect_to_mongo()
 
-    # Ensure DB connection is established before proceeding
-    db = db_service.get_db() # Get the synchronous DB instance
-    if db is None: # Correct check for None
+    db = db_service.get_db()
+    if db is None:
         logger.critical("Database connection failed on startup. Aborting background task setup.")
-        # Optionally raise an error or handle differently
-        yield # Allow app to potentially start but background task won't run
+        yield
         logger.info("Application shutdown...")
         await close_mongo_connection()
-        return # Exit lifespan early
+        return
 
-    # Create repository instances needed for the broadcast task
-    # Pass the synchronous pymongo Database object
     repo_config_repo = RepositoryConfigRepository(db=db)
 
-    # Start the WebSocket broadcast task, passing necessary dependencies
     logger.info("Starting WebSocket status broadcast task...")
-    # Pass the repository instance to the task function
     background_task = asyncio.create_task(broadcast_status_updates(repo_config_repo=repo_config_repo))
 
     yield # Application runs here
 
-    # Code to run on shutdown
     logger.info("Application shutdown...")
     if background_task:
         logger.info("Cancelling WebSocket status broadcast task...")
@@ -64,33 +66,26 @@ async def lifespan(app: FastAPI):
 
     await close_mongo_connection()
 
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins_list,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    ),
+]
+
 app = FastAPI(
     title=settings.APP_NAME,
     description="Backend API for PaaS platform integrating GitHub, Docker, and Kubernetes.",
     version="0.1.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    middleware=middleware # Removed middleware list application here
 )
 
-origins = [
-    "http://localhost:8080",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Include routers
 app.include_router(auth_views.router, prefix="/auth", tags=["Authentication"])
 app.include_router(github_views.router, prefix="/repositories", tags=["GitHub Repositories"])
 app.include_router(build_views.router, prefix="/build", tags=["Builds"])
 app.include_router(webhooks_views.router, prefix="/webhooks", tags=["Webhooks"])
-app.include_router(containers_controller.router)
-
-
-@app.get("/health", tags=["Health Check"])
-async def health_check():
-    return {"status": "OK"}
+app.include_router(containers_views.router) # Prefix defined in view

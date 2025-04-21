@@ -1,173 +1,235 @@
-import subprocess
-import multiprocessing
-import time
-import os
-import shutil
-import json
+import docker
+from docker.errors import BuildError, APIError, ImageNotFound
 import logging
-from datetime import datetime
-from typing import Any, Optional, Dict # Import Dict
+import os
+import tempfile
+import shutil
+import git
+from typing import Optional, Tuple, Callable, AsyncGenerator, Dict, Any, Generator # Added Generator
+import asyncio
+import functools # Import functools
+
+# Import settings from config
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Define message types for clarity
-MSG_TYPE_STATUS = "status"
-MSG_TYPE_LOG = "log"
-MSG_TYPE_ERROR = "error"
-MSG_TYPE_COMMIT_INFO = "commit_info" 
-MSG_TYPE_END = "end"
+class DockerBuildService:
+    """Handles Docker image building from Git repositories."""
 
-def send_message(queue: multiprocessing.Queue, build_id: str, msg_type: str, payload: Any): 
-    """Helper to send structured messages to the queue."""
-    try:
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        message = json.dumps({
-            "build_id": build_id,
-            "type": msg_type,
-            "payload": payload,
-            "timestamp": timestamp
-        })
-        queue.put(message)
-    except Exception as e:
-        logger.error(f"Build {build_id}: Failed to put message on queue: {e}")
+    def __init__(self):
+        try:
+            self.client = docker.from_env()
+            logger.info("Docker client initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Docker client: {e}", exc_info=True)
+            self.client = None
 
-def stream_process_output(process: subprocess.Popen, queue: multiprocessing.Queue, build_id: str):
-    """Reads stdout/stderr line by line and sends to queue."""
-    stderr_output = ""
-    if process.stdout:
-        for line in iter(process.stdout.readline, b''):
-            decoded_line = line.decode('utf-8', errors='replace').strip()
-            if decoded_line: 
-                send_message(queue, build_id, MSG_TYPE_LOG, decoded_line)
-        process.stdout.close()
-    
-    if process.stderr:
-        stderr_output = process.stderr.read().decode('utf-8', errors='replace').strip()
-        if stderr_output:
-             send_message(queue, build_id, MSG_TYPE_ERROR, f"STDERR: {stderr_output}")
-        process.stderr.close()
-        
-    return stderr_output
+    # This function now runs synchronously within a thread
+    def _process_sync_stream(
+        self,
+        build_stream: Generator[Dict[str, Any], None, None],
+        log_file_path: str,
+        log_callback: Optional[Callable[[str], Any]] = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None # Pass the loop for run_coroutine_threadsafe
+    ) -> Tuple[bool, Optional[str]]:
+        """Processes the Docker build log stream synchronously."""
+        image_id = None
+        build_successful = False # Start assuming failure
+        last_log_line = ""
+        has_seen_success_message = False # Flag to track if success message was seen
 
-# Update to return a dictionary with sha and message
-def get_commit_info(clone_dir: str) -> Optional[Dict[str, str]]:
-     """Gets the current commit SHA and message from a git repository directory."""
-     try:
-         sha_result = subprocess.run(
-             ["git", "rev-parse", "HEAD"],
-             cwd=clone_dir, capture_output=True, text=True, check=True
-         )
-         sha = sha_result.stdout.strip()
-         
-         # Get commit message (subject line)
-         msg_result = subprocess.run(
-             ["git", "log", "-1", "--pretty=%s"], # %s gets subject line
-             cwd=clone_dir, capture_output=True, text=True, check=True
-         )
-         message = msg_result.stdout.strip()
-         
-         return {"sha": sha, "message": message}
-     except Exception as e:
-         logger.error(f"Failed to get commit info in {clone_dir}: {e}")
-         return None
+        try:
+            with open(log_file_path, 'a') as log_file:
+                for chunk in build_stream: # Use standard 'for' loop
+                    if 'stream' in chunk:
+                        line = chunk['stream'].strip()
+                        if line:
+                            log_file.write(line + '\n')
+                            log_file.flush()
+                            last_log_line = line
+                            if log_callback and loop:
+                                # Directly schedule the coroutine returned by log_callback(line)
+                                # Assumes log_callback returns a coroutine (like send_log_update)
+                                try:
+                                    # Create the coroutine by calling the callback
+                                    coro = log_callback(line)
+                                    # Schedule it to run on the main event loop
+                                    asyncio.run_coroutine_threadsafe(coro, loop)
+                                except Exception as call_e:
+                                     logger.error(f"Error scheduling log callback: {call_e}", exc_info=True)
 
 
-def run_build_task(queue: multiprocessing.Queue, build_id: str, repo_url: str, branch: str):
-    """The main function executed by the build runner process."""
-    
-    send_message(queue, build_id, MSG_TYPE_STATUS, "Build process started.")
-    logger.info(f"Build {build_id}: Runner process started for {repo_url} branch {branch}")
-    
-    commit_info: Optional[Dict[str, str]] = None # Store commit info dict
+                            # Check for success message within the stream
+                            if "Successfully built" in line:
+                                logger.info("Detected 'Successfully built' message in stream (sync).")
+                                has_seen_success_message = True # Set the flag
 
-    try:
-        repo_full_name = '/'.join(repo_url.split('/')[-2:]).replace('.git', '')
-        repo_name = repo_full_name.split('/')[-1]
-    except IndexError:
-        logger.error(f"Build {build_id}: Could not parse repository name from URL: {repo_url}")
-        send_message(queue, build_id, MSG_TYPE_ERROR, f"Could not parse repository name from URL: {repo_url}")
-        send_message(queue, build_id, MSG_TYPE_END, "Build failed.")
-        queue.put(None) 
-        return 
+                    elif 'aux' in chunk and 'ID' in chunk['aux']:
+                        image_id = chunk['aux']['ID']
+                        logger.info(f"Detected image ID during build (sync): {image_id}")
+                    elif 'errorDetail' in chunk:
+                        error_message = chunk['errorDetail']['message']
+                        log_file.write(f"ERROR: {error_message}\n")
+                        log_file.flush()
+                        if log_callback and loop:
+                             try:
+                                 coro = log_callback(f"ERROR: {error_message}")
+                                 asyncio.run_coroutine_threadsafe(coro, loop)
+                             except Exception as call_e:
+                                 logger.error(f"Error scheduling error log callback: {call_e}", exc_info=True)
 
-    clone_dir = f"/tmp/{build_id}_{repo_name}"
-    
-    try:
-        # 1. Clean up previous directory if exists
-        if os.path.exists(clone_dir):
-            send_message(queue, build_id, MSG_TYPE_STATUS, f"Cleaning up existing directory: {clone_dir}")
-            shutil.rmtree(clone_dir)
-            
-        # 2. Clone the repository
-        send_message(queue, build_id, MSG_TYPE_STATUS, f"Cloning repository {repo_url} branch {branch} into {clone_dir}...")
-        git_clone_cmd = ["git", "clone", "--branch", branch, "--depth", "1", repo_url, clone_dir]
-        
-        process = subprocess.Popen(git_clone_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stderr_output = stream_process_output(process, queue, build_id)
-        return_code = process.wait()
+                        logger.error(f"Build error reported by Docker (sync): {error_message}")
+                        build_successful = False # Explicitly mark as failed on error
 
-        if return_code != 0:
-            error_msg = f"Git clone failed with return code {return_code}."
-            if stderr_output: error_msg += f" Error details: {stderr_output}"
-            raise Exception(error_msg)
-            
-        send_message(queue, build_id, MSG_TYPE_STATUS, "Repository cloned successfully.")
+            build_successful = has_seen_success_message
 
-        # 3. Get Commit Info (SHA and Message)
-        commit_info = get_commit_info(clone_dir)
-        if commit_info:
-             # Send commit info as payload (dictionary)
-             send_message(queue, build_id, MSG_TYPE_COMMIT_INFO, commit_info) 
-             send_message(queue, build_id, MSG_TYPE_STATUS, f"Building commit: {commit_info['sha'][:7]} ({commit_info['message']})")
-        else:
-             send_message(queue, build_id, MSG_TYPE_ERROR, "Failed to retrieve commit info.")
-             logger.error(f"Build {build_id}: Could not get commit info.")
+            if build_successful:
+                 logger.info("Final determination: Build successful (success message was detected).")
+            else:
+                 logger.warning("Final determination: Build failed (success message not detected or error occurred).")
 
 
-        # 4. Build the Docker image
-        dockerfile_path = os.path.join(clone_dir, "Dockerfile") 
-        if not os.path.exists(dockerfile_path):
-             raise FileNotFoundError(f"Dockerfile not found in the root of repository {repo_full_name} branch {branch}")
-             
-        image_tag = f"cypher-build:{build_id}" 
-        
-        send_message(queue, build_id, MSG_TYPE_STATUS, f"Starting Docker build (tag: {image_tag}, no-cache)...")
-        docker_build_cmd = ["docker", "build", "--no-cache", "-t", image_tag, "."] 
-        
-        process = subprocess.Popen(docker_build_cmd, cwd=clone_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE) 
-        stderr_output = stream_process_output(process, queue, build_id)
-        return_code = process.wait()
+            logger.info(f"Finished processing build stream (sync). Success: {build_successful}, Image ID: {image_id}")
+            return build_successful, image_id
 
-        if return_code != 0:
-            error_msg = f"Docker build failed with return code {return_code}."
-            if stderr_output: error_msg += f" Error details: {stderr_output}"
-            raise Exception(error_msg)
-
-        send_message(queue, build_id, MSG_TYPE_STATUS, f"Docker image built successfully: {image_tag}")
-        
-        # TODO: Add Docker push step if needed
-        
-        send_message(queue, build_id, MSG_TYPE_END, "Build completed successfully.")
-        logger.info(f"Build {build_id}: Completed successfully.")
-
-    except FileNotFoundError as e:
-         error_msg = f"Build failed: {e}"
-         logger.error(f"Build {build_id}: {error_msg}")
-         send_message(queue, build_id, MSG_TYPE_ERROR, error_msg)
-         send_message(queue, build_id, MSG_TYPE_END, "Build failed.")
-    except Exception as e:
-        error_msg = f"An unexpected error occurred during build: {e}"
-        logger.error(f"Build {build_id}: {error_msg}", exc_info=True)
-        send_message(queue, build_id, MSG_TYPE_ERROR, error_msg)
-        send_message(queue, build_id, MSG_TYPE_END, "Build failed.")
-    finally:
-        if os.path.exists(clone_dir):
+        except Exception as e:
+            logger.error(f"Error processing build stream or writing logs (sync): {e}", exc_info=True)
             try:
-                send_message(queue, build_id, MSG_TYPE_STATUS, f"Cleaning up build directory: {clone_dir}")
-                shutil.rmtree(clone_dir)
+                with open(log_file_path, 'a') as log_file:
+                    log_file.write(f"FATAL ERROR processing logs: {e}\n")
+            except Exception as log_err:
+                 logger.error(f"Could not even write fatal error to log file: {log_err}")
+            return False, None
+
+    async def build_image_from_git(
+        self,
+        repo_url: str,
+        branch: str,
+        tag_version: str,
+        repo_full_name: str, # e.g., "owner/repo"
+        build_id: str, # For logging correlation
+        log_file_path: str,
+        log_callback: Optional[Callable[[str], Any]] = None
+    ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+        """
+        Clones a Git repo, builds a Docker image, streams logs, and returns status.
+
+        Returns: (success: bool, error_message: Optional[str], image_id: Optional[str], final_image_tag: Optional[str])
+        """
+        if not self.client:
+            logger.error("Docker client not available. Cannot build image.")
+            return False, "Docker client unavailable", None, None
+
+        registry_prefix = settings.DOCKER_REGISTRY_URL.rstrip('/') + "/" if settings.DOCKER_REGISTRY_URL else ""
+        image_tag_base = f"{repo_full_name.lower().replace('/', '-')}"
+        final_image_tag = f"{registry_prefix}{image_tag_base}:{tag_version}"
+        logger.info(f"Attempting to build image with tag: {final_image_tag} for build ID: {build_id}")
+
+        temp_dir = tempfile.mkdtemp(prefix=f"cypher_build_{build_id}_")
+        logger.info(f"Created temporary directory for cloning: {temp_dir}")
+
+        try:
+            # 1. Clone the repository (blocking)
+            logger.info(f"Cloning repository {repo_url} branch {branch} into {temp_dir}")
+            await asyncio.to_thread(git.Repo.clone_from, repo_url, temp_dir, branch=branch, depth=1)
+            logger.info(f"Successfully cloned repository for build {build_id}")
+
+            # 2. Start the Docker build (blocking API call, returns sync generator)
+            logger.info(f"Starting Docker build process for {final_image_tag} from path {temp_dir}")
+            build_stream_generator = self.client.api.build(
+                path=temp_dir,
+                tag=final_image_tag,
+                rm=True,
+                pull=True,
+                decode=True,
+                nocache=False
+            )
+
+            # 3. Process the synchronous build stream in a separate thread
+            logger.info(f"Processing build stream in thread for build {build_id}")
+            current_loop = asyncio.get_running_loop()
+            process_func = functools.partial(
+                self._process_sync_stream,
+                build_stream=build_stream_generator,
+                log_file_path=log_file_path,
+                log_callback=log_callback,
+                loop=current_loop
+            )
+            success, image_id = await asyncio.to_thread(process_func)
+            logger.info(f"Finished processing build stream thread for build {build_id}. Success: {success}")
+
+
+            if success:
+                logger.info(f"Docker build successful for {final_image_tag}. Image ID: {image_id}")
+                return True, None, image_id, final_image_tag
+            else:
+                logger.error(f"Docker build failed for {final_image_tag}.")
+                error_detail = "Build failed. Check logs for details."
+                try:
+                    with open(log_file_path, 'r') as f:
+                        lines = f.readlines()
+                        if lines: error_detail = lines[-1].strip()
+                except Exception: pass
+                return False, error_detail, None, None
+
+        except git.GitCommandError as e:
+            logger.error(f"Git clone failed for {repo_url} branch {branch}: {e}", exc_info=True)
+            with open(log_file_path, 'a') as log_file:
+                 log_file.write(f"ERROR: Git clone failed: {e.stderr}\n")
+            # Schedule callback safely
+            if log_callback:
+                try:
+                    asyncio.run_coroutine_threadsafe(log_callback(f"ERROR: Git clone failed: {e.stderr}"), asyncio.get_running_loop())
+                except Exception as call_e:
+                    logger.error(f"Error scheduling git error log callback: {call_e}", exc_info=True)
+            return False, f"Git clone failed: {e.stderr}", None, None
+        except BuildError as e:
+            logger.error(f"Docker build failed (BuildError) for {final_image_tag}: {e}", exc_info=True)
+            error_msg = f"Docker build failed: {getattr(e, 'msg', str(e))}"
+            with open(log_file_path, 'a') as log_file:
+                 log_file.write(f"ERROR: {error_msg}\n")
+            # Schedule callback safely
+            if log_callback:
+                try:
+                    asyncio.run_coroutine_threadsafe(log_callback(f"ERROR: {error_msg}"), asyncio.get_running_loop())
+                except Exception as call_e:
+                    logger.error(f"Error scheduling build error log callback: {call_e}", exc_info=True)
+            return False, error_msg, None, None
+        except APIError as e:
+            logger.error(f"Docker API error during build for {final_image_tag}: {e}", exc_info=True)
+            error_msg = f"Docker API error: {e.explanation}"
+            with open(log_file_path, 'a') as log_file:
+                 log_file.write(f"ERROR: {error_msg}\n")
+            # Schedule callback safely
+            if log_callback:
+                try:
+                    asyncio.run_coroutine_threadsafe(log_callback(f"ERROR: {error_msg}"), asyncio.get_running_loop())
+                except Exception as call_e:
+                    logger.error(f"Error scheduling API error log callback: {call_e}", exc_info=True)
+            return False, error_msg, None, None
+        except Exception as e:
+            logger.error(f"Unexpected error during build process for {final_image_tag}: {e}", exc_info=True)
+            error_msg = f"Unexpected build error: {e}"
+            try:
+                 with open(log_file_path, 'a') as log_file:
+                      log_file.write(f"ERROR: {error_msg}\n")
+                 # Schedule callback safely
+                 if log_callback:
+                     try:
+                         asyncio.run_coroutine_threadsafe(log_callback(f"ERROR: {error_msg}"), asyncio.get_running_loop())
+                     except Exception as call_e:
+                         logger.error(f"Error scheduling unexpected error log callback: {call_e}", exc_info=True)
+            except Exception as log_err:
+                 logger.error(f"Could not write unexpected build error to log file: {log_err}")
+            return False, error_msg, None, None
+        finally:
+            # 4. Clean up the temporary directory
+            try:
+                await asyncio.to_thread(shutil.rmtree, temp_dir)
+                logger.info(f"Removed temporary directory: {temp_dir}")
             except Exception as e:
-                 logger.error(f"Build {build_id}: Failed to clean up directory {clone_dir}: {e}")
-                 send_message(queue, build_id, MSG_TYPE_ERROR, f"Failed to clean up directory {clone_dir}")
-        
-        queue.put(None) 
-        logger.info(f"Build {build_id}: Runner process finished.")
+                logger.error(f"Failed to remove temporary directory {temp_dir}: {e}", exc_info=True)
+
+# Instantiate the service
+docker_build_service = DockerBuildService()

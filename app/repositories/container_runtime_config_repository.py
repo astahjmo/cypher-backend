@@ -1,98 +1,80 @@
-from pymongo import MongoClient # Use pymongo MongoClient
-from pymongo.database import Database, Collection # Use pymongo types
-from pymongo.results import UpdateResult, DeleteResult # Import result types
-# Corrected import paths assuming execution from parent directory or app in PYTHONPATH
-# Use the updated models with PyObjectId and LabelPair
-from models import ContainerRuntimeConfig, PyObjectId, LabelPair
-from config import settings
-from typing import Optional, List
+from pymongo.database import Database
+from pymongo.errors import ConnectionFailure, OperationFailure
+from pymongo import ReturnDocument
 from bson import ObjectId
-from datetime import datetime, timezone # Import timezone
+from typing import Optional, List
+import logging
+from datetime import datetime, timezone
+
+# Import ContainerRuntimeConfig model from its new location
+from models.container.db_models import ContainerRuntimeConfig
+# Import PyObjectId from base
+from models.base import PyObjectId
+# Import get_database dependency
+from services.db_service import get_database
+from fastapi import Depends # Keep Depends for dependency injection
+
+logger = logging.getLogger(__name__)
 
 class ContainerRuntimeConfigRepository:
-    """Repository for managing container runtime configurations in MongoDB using pymongo."""
+    """Handles database operations for ContainerRuntimeConfig objects."""
 
-    _collection: Collection # Use pymongo Collection type
-
-    def __init__(self, db: Database): # Expect pymongo Database object
-        """Initializes the repository with the database instance."""
-        self._collection = db["container_runtime_configs"]
+    def __init__(self, db: Database):
+        self.collection = db["container_runtime_configs"]
+        logger.info("ContainerRuntimeConfigRepository initialized.")
 
     def get_by_repo_and_user(self, repo_full_name: str, user_id: PyObjectId) -> Optional[ContainerRuntimeConfig]:
-        """Finds a runtime configuration by repository full name and user ID (synchronous)."""
-        # user_id should already be PyObjectId due to API validation, but handle string just in case
-        if isinstance(user_id, str):
-            query_user_id = ObjectId(user_id)
-        elif isinstance(user_id, ObjectId): # Check for ObjectId directly
-            query_user_id = user_id
-        else:
-            # This path might not be reachable if API validation is strict
-            raise TypeError("user_id must be ObjectId or a valid string representation")
-
-        config_doc = self._collection.find_one({"repo_full_name": repo_full_name, "user_id": query_user_id})
-        if config_doc:
-            # Pydantic should handle the deserialization including the new 'labels' field
-            return ContainerRuntimeConfig(**config_doc)
-        return None
+        """Finds a configuration by repository full name and user ID."""
+        print(user_id)
+        logger.debug(f"Finding container runtime config for repo: {repo_full_name}, user ID: {user_id}")
+        try:
+            config_data = self.collection.find_one({"repo_full_name": repo_full_name, "user_id": str(user_id)})
+            if config_data:
+                return ContainerRuntimeConfig.model_validate(config_data) # Use model_validate
+            return None
+        except OperationFailure as e:
+            logger.error(f"Database operation failed finding runtime config for repo {repo_full_name}, user {user_id}: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error finding runtime config for repo {repo_full_name}, user {user_id}: {e}", exc_info=True)
+            raise
 
     def upsert(self, config: ContainerRuntimeConfig) -> ContainerRuntimeConfig:
-        """Creates or updates a container runtime configuration (synchronous)."""
-        # Ensure user_id is set and is ObjectId before saving
-        if config.user_id is None:
-            raise ValueError("user_id cannot be None for upsert operation")
+        """Creates or updates a container runtime configuration."""
+        logger.info(f"Upserting container runtime config for repo: {config.repo_full_name}, user ID: {config.user_id}")
+        try:
+            # Ensure dates are set correctly before upsert
+            config.updated_at = datetime.now(timezone.utc)
+            # Use model_dump for Pydantic v2, exclude 'id' if it's default factory generated
+            # Use by_alias=True to handle the '_id' field correctly
+            update_data = config.model_dump(by_alias=True, exclude={'id', 'created_at'}) # Exclude created_at from $set
 
-        if isinstance(config.user_id, str):
-             query_user_id = ObjectId(config.user_id)
-        elif isinstance(config.user_id, ObjectId):
-             query_user_id = config.user_id
-        else:
-             raise TypeError("user_id must be ObjectId or a valid string representation")
+            # Perform the upsert operation
+            updated_doc = self.collection.find_one_and_update(
+                {"repo_full_name": config.repo_full_name, "user_id": config.user_id},
+                {
+                    "$set": update_data,
+                    "$setOnInsert": {"created_at": config.created_at or datetime.now(timezone.utc)} # Set created_at only on insert
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER # Return the modified document
+            )
 
-        # Prepare the document for MongoDB, converting Pydantic models to dicts
-        # Use model_dump for Pydantic v2
-        config_dict_for_set = config.model_dump(by_alias=True, exclude={"id", "created_at"})
+            if updated_doc:
+                return ContainerRuntimeConfig.model_validate(updated_doc) # Use model_validate
+            else:
+                # This case might indicate an issue with the upsert logic or query
+                logger.error(f"Upsert operation for runtime config {config.repo_full_name} failed to return document.")
+                raise OperationFailure("Failed to retrieve configuration after saving.")
 
-        # Ensure user_id in the dict is ObjectId type
-        config_dict_for_set['user_id'] = query_user_id
+        except OperationFailure as e:
+            logger.error(f"Database operation failed upserting runtime config for repo {config.repo_full_name}, user {config.user_id}: {e}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error upserting runtime config for repo {config.repo_full_name}, user {config.user_id}: {e}", exc_info=True)
+            raise
 
-        # Explicitly set updated_at for the $set operation using timezone-aware UTC now
-        config_dict_for_set['updated_at'] = datetime.now(timezone.utc)
-
-        # Use update_one with upsert=True
-        # The $set operation will automatically include the 'labels' field if present in config_dict_for_set
-        result: UpdateResult = self._collection.update_one(
-            {"repo_full_name": config.repo_full_name, "user_id": query_user_id},
-            {
-                "$set": config_dict_for_set,
-                # Set created_at only on insert using timezone-aware UTC now
-                "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
-            },
-            upsert=True
-        )
-
-        # Retrieve the document after upsert to return the full object with _id
-        updated_doc = self._collection.find_one(
-             {"repo_full_name": config.repo_full_name, "user_id": query_user_id}
-        )
-
-        if updated_doc:
-            # Pydantic handles deserialization, including 'labels'
-            return ContainerRuntimeConfig(**updated_doc)
-        else:
-            # This should ideally not happen after a successful upsert
-            raise Exception("Failed to retrieve document after upsert operation")
-
-
-    def delete_by_repo_and_user(self, repo_full_name: str, user_id: PyObjectId) -> bool:
-        """Deletes a runtime configuration by repository full name and user ID (synchronous)."""
-        if isinstance(user_id, str):
-            query_user_id = ObjectId(user_id)
-        elif isinstance(user_id, ObjectId):
-            query_user_id = user_id
-        else:
-            raise TypeError("user_id must be ObjectId or a valid string representation")
-
-        result: DeleteResult = self._collection.delete_one({"repo_full_name": repo_full_name, "user_id": query_user_id})
-        return result.deleted_count > 0
-
-    # Potentially add other methods like get_by_id if needed
+# --- FastAPI Dependency ---
+def get_container_runtime_config_repo(db: Database = Depends(get_database)) -> ContainerRuntimeConfigRepository:
+    """FastAPI dependency to get an instance of ContainerRuntimeConfigRepository."""
+    return ContainerRuntimeConfigRepository(db=db)
