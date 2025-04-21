@@ -4,17 +4,34 @@ from kubernetes.client.exceptions import ApiException
 from ..config import settings
 import time
 import uuid
-import json # Import json at the top
+import json
 
 logger = logging.getLogger(__name__)
 
+
 class KubernetesService:
+    """Provides an interface for interacting with a Kubernetes cluster.
+
+    Handles loading Kubernetes configuration and creating resources like Jobs.
+
+    Attributes:
+        core_v1_api: Kubernetes CoreV1Api client instance.
+        batch_v1_api: Kubernetes BatchV1Api client instance.
+    """
+
     def __init__(self):
+        """Initializes the KubernetesService.
+
+        Loads Kubernetes configuration from KUBECONFIG_PATH, in-cluster config,
+        or default kubeconfig, and initializes API client instances.
+        Sets API clients to None if initialization fails.
+        """
         try:
-            # Load Kubernetes configuration (logic remains the same)
             if settings.KUBECONFIG_PATH:
                 config.load_kube_config(config_file=settings.KUBECONFIG_PATH)
-                logger.info(f"Loaded Kubernetes config from: {settings.KUBECONFIG_PATH}")
+                logger.info(
+                    f"Loaded Kubernetes config from: {settings.KUBECONFIG_PATH}"
+                )
             else:
                 try:
                     config.load_incluster_config()
@@ -31,25 +48,51 @@ class KubernetesService:
             self.core_v1_api = None
             self.batch_v1_api = None
 
-    def run_build_job(self, image_name: str, repo_url: str, branch: str, commit_sha: str, build_image_tag: str) -> tuple[bool, str]:
-        """
-        Creates and runs a Kubernetes Job to perform a Git clone, Docker build, and push.
-        Includes the commit SHA for logging and potentially for checkout.
-        Requires appropriate volume mounts and secrets configured in the cluster.
+    def run_build_job(
+        self,
+        image_name: str,
+        repo_url: str,
+        branch: str,
+        commit_sha: str,
+        build_image_tag: str,
+    ) -> tuple[bool, str]:
+        """Creates and runs a Kubernetes Job to build and push a Docker image from Git.
+
+        The Job runs a container (using 'docker:git' image) that performs the following steps:
+        1. Clones the specified branch of the repository.
+        2. Builds a Docker image using the Dockerfile in the repository root.
+        3. Logs into the configured Docker registry using credentials from a K8s secret ('registry-creds').
+        4. Pushes the built image to the registry with the specified tag.
+
+        Assumes necessary RBAC permissions, secrets ('registry-creds'), and Docker daemon access
+        (e.g., via mounted Docker socket) are configured in the Kubernetes cluster.
+
+        Args:
+            image_name (str): Base name for the image and job resources (e.g., 'my-app').
+            repo_url (str): The URL of the Git repository to clone.
+            branch (str): The branch to clone and build.
+            commit_sha (str): The specific commit SHA being built (used for logging).
+            build_image_tag (str): The full tag for the Docker image to be built and pushed
+                                   (e.g., 'registry.example.com/owner/repo:latest').
+
+        Returns:
+            tuple[bool, str]: A tuple containing:
+                - bool: True if the Job creation API call was successful, False otherwise.
+                - str: The generated name of the Kubernetes Job if creation was successful,
+                       or an error message if it failed.
         """
         if not self.batch_v1_api or not self.core_v1_api:
-             logger.error("Attempted to run build job, but Kubernetes client is not available.")
-             return False, "Kubernetes client not available."
+            logger.error(
+                "Attempted to run build job, but Kubernetes client is not available."
+            )
+            return False, "Kubernetes client not available."
 
         job_name = f"{image_name}-build-{uuid.uuid4().hex[:6]}"
         namespace = settings.K8S_NAMESPACE
-        # Define workspace path within the pod
         workspace_path = "/workspace"
 
-        # --- Define Build Steps ---
-        # Include commit_sha in the script for logging
         build_script = f"""
-            set -e # Exit immediately if a command exits with a non-zero status.
+            set -e
             echo "--- Starting build job: {job_name} ---"
             echo "Repo: {repo_url}"
             echo "Branch: {branch}"
@@ -57,20 +100,14 @@ class KubernetesService:
             echo "Target Image: {build_image_tag}"
 
             echo "--- Cloning repository ---"
-            # Clone the specific branch first
             git clone --branch "{branch}" --depth 1 "{repo_url}" "{workspace_path}"
             cd "{workspace_path}"
-            # Optional: Checkout the specific commit SHA if needed, though cloning the branch tip is often sufficient for CI/CD
-            # echo "Checking out specific commit: {commit_sha}"
-            # git checkout "{commit_sha}"
-            echo "Cloned commit:" $(git rev-parse HEAD) # Log the actual commit used
+            echo "Cloned commit:" $(git rev-parse HEAD)
 
             echo "--- Building Docker image ---"
-            # Assumes Docker daemon access (e.g., via mounted socket or Docker-in-Docker sidecar)
             docker build -t "{build_image_tag}" .
 
             echo "--- Logging into registry: {settings.REGISTRY_URL} ---"
-            # Assumes REGISTRY_USER and REGISTRY_PASSWORD are set as env vars from secrets
             echo "$REGISTRY_PASSWORD" | docker login "{settings.REGISTRY_URL}" -u "$REGISTRY_USER" --password-stdin
 
             echo "--- Pushing Docker image ---"
@@ -79,88 +116,98 @@ class KubernetesService:
             echo "--- Build job {job_name} completed successfully ---"
         """
 
-        # --- Define Container ---
         container = client.V1Container(
             name=f"{image_name}-build-container",
-            image="docker:git", # Use an image with both docker and git
+            image="docker:git",
             command=["/bin/sh", "-c"],
             args=[build_script],
-            working_dir=workspace_path, # Set working directory for the script
+            working_dir=workspace_path,
             env=[
                 client.V1EnvVar(name="REPO_URL", value=repo_url),
                 client.V1EnvVar(name="BRANCH", value=branch),
-                client.V1EnvVar(name="COMMIT_SHA", value=commit_sha), # Pass commit SHA as env var if needed by script logic elsewhere
+                client.V1EnvVar(name="COMMIT_SHA", value=commit_sha),
                 client.V1EnvVar(name="IMAGE_TAG", value=build_image_tag),
-                # --- IMPORTANT: Mount credentials securely via Secrets ---
-                client.V1EnvVar(name="REGISTRY_USER", value_from=client.V1EnvVarSource(secret_key_ref=client.V1SecretKeySelector(name="registry-creds", key="username", optional=False))), # Mark as non-optional
-                client.V1EnvVar(name="REGISTRY_PASSWORD", value_from=client.V1EnvVarSource(secret_key_ref=client.V1SecretKeySelector(name="registry-creds", key="password", optional=False))), # Mark as non-optional
-                # Optional: Git token for private repos
-                # client.V1EnvVar(name="GIT_TOKEN", value_from=client.V1EnvVarSource(secret_key_ref=client.V1SecretKeySelector(name="git-creds", key="token", optional=True))),
+                client.V1EnvVar(
+                    name="REGISTRY_USER",
+                    value_from=client.V1EnvVarSource(
+                        secret_key_ref=client.V1SecretKeySelector(
+                            name="registry-creds", key="username", optional=False
+                        )
+                    ),
+                ),
+                client.V1EnvVar(
+                    name="REGISTRY_PASSWORD",
+                    value_from=client.V1EnvVarSource(
+                        secret_key_ref=client.V1SecretKeySelector(
+                            name="registry-creds", key="password", optional=False
+                        )
+                    ),
+                ),
             ],
             volume_mounts=[
-                # Mount Docker socket
-                client.V1VolumeMount(name="docker-sock", mount_path="/var/run/docker.sock"),
-                # Optional: Mount a persistent volume for workspace/cache if needed
-                # client.V1VolumeMount(name="workspace-volume", mount_path=workspace_path),
-            ]
+                client.V1VolumeMount(
+                    name="docker-sock", mount_path="/var/run/docker.sock"
+                ),
+            ],
         )
 
-        # --- Define Volumes ---
         volumes = [
-             # Mount host's Docker socket
-             client.V1Volume(name="docker-sock", host_path=client.V1HostPathVolumeSource(path="/var/run/docker.sock")),
-             # Optional: Define persistent volume claim if using workspace-volume mount
-             # client.V1Volume(name="workspace-volume", persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(claim_name="build-workspace-pvc")),
+            client.V1Volume(
+                name="docker-sock",
+                host_path=client.V1HostPathVolumeSource(path="/var/run/docker.sock"),
+            ),
         ]
 
-        # --- Define Job ---
         template = client.V1PodTemplateSpec(
             metadata=client.V1ObjectMeta(labels={"app": image_name, "type": "build"}),
             spec=client.V1PodSpec(
                 restart_policy="Never",
                 containers=[container],
                 volumes=volumes,
-                # Optional: Specify service account if needed for permissions
-                # service_account_name="build-service-account"
-                )
+            ),
         )
-        # Job spec: backoff limit, TTL for cleanup
+
         job_spec = client.V1JobSpec(
-            template=template,
-            backoff_limit=1, # Retry once on failure
-            ttl_seconds_after_finished=3600 # Clean up job 1 hour after completion
+            template=template, backoff_limit=1, ttl_seconds_after_finished=3600
         )
         job = client.V1Job(
             api_version="batch/v1",
             kind="Job",
             metadata=client.V1ObjectMeta(name=job_name, namespace=namespace),
-            spec=job_spec
+            spec=job_spec,
         )
 
-        # --- Create Job ---
         try:
-            logger.info(f"Creating Kubernetes Job: {job_name} in namespace {namespace} for commit {commit_sha[:7]}")
-            # The create_namespaced_job call itself will raise ApiException on failure
-            api_response = self.batch_v1_api.create_namespaced_job(body=job, namespace=namespace)
-            # If we reach here, the job creation API call was accepted by K8s.
-            # Avoid accessing api_response.status which caused type errors.
+            logger.info(
+                f"Creating Kubernetes Job: {job_name} in namespace {namespace} for commit {commit_sha[:7]}"
+            )
+            api_response = self.batch_v1_api.create_namespaced_job(
+                body=job, namespace=namespace
+            )
             logger.info(f"Job {job_name} creation request accepted by Kubernetes API.")
-            return True, job_name # Return job name on successful API call
+            return True, job_name
         except ApiException as e:
-            logger.error(f"ApiException when creating Kubernetes Job {job_name}: {e.reason}\nBody: {e.body}", exc_info=False)
+            logger.error(
+                f"ApiException when creating Kubernetes Job {job_name}: {e.reason}\nBody: {e.body}",
+                exc_info=False,
+            )
             error_message = e.reason
             if isinstance(e.body, str) and e.body:
                 try:
                     body_json = json.loads(e.body)
                     error_message = body_json.get("message", e.reason)
                 except json.JSONDecodeError:
-                    logger.warning(f"Could not decode ApiException body as JSON: {e.body}")
+                    logger.warning(
+                        f"Could not decode ApiException body as JSON: {e.body}"
+                    )
             return False, f"Failed to create K8s Job: {error_message}"
         except Exception as e:
-            logger.error(f"Unexpected error creating Kubernetes Job {job_name}: {e}", exc_info=True)
+            logger.error(
+                f"Unexpected error creating Kubernetes Job {job_name}: {e}",
+                exc_info=True,
+            )
             return False, f"Unexpected error creating K8s Job: {e}"
 
-    # TODO: Add functions to get job status, logs, etc.
 
-# Single instance
+# Singleton instance of the KubernetesService
 k8s_service = KubernetesService()
